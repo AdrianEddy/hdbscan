@@ -1,6 +1,7 @@
 use crate::{distance, DistanceMetric};
 use num_traits::Float;
 use rayon::prelude::*;
+use std::sync::{ Arc, atomic::{ AtomicUsize, Ordering::SeqCst }};
 
 /// The nearest neighbour algorithm options
 #[derive(Debug, Clone, PartialEq)]
@@ -19,6 +20,7 @@ pub(crate) trait CoreDistance {
         data: &[Vec<T>],
         k: usize,
         dist_metric: DistanceMetric,
+        progress: Arc<AtomicUsize>,
     ) -> Vec<T>;
 }
 
@@ -29,13 +31,14 @@ impl CoreDistance for BruteForce {
         data: &[Vec<T>],
         k: usize,
         dist_metric: DistanceMetric,
+        progress: Arc<AtomicUsize>,
     ) -> Vec<T> {
-        let dist_matrix = calc_pairwise_distances_parallel(data, distance::get_dist_func(&dist_metric));
+        let dist_matrix = calc_pairwise_distances_parallel(data, distance::get_dist_func(&dist_metric), progress.clone());
         get_core_distances_from_matrix(&dist_matrix, k)
     }
 }
 
-fn calc_pairwise_distances_parallel<T, F>(data: &[Vec<T>], dist_func: F) -> Vec<Vec<T>>
+fn calc_pairwise_distances_parallel<T, F>(data: &[Vec<T>], dist_func: F, progress: Arc<AtomicUsize>) -> Vec<Vec<T>>
 where
     T: Float + Send + Sync,
     F: Fn(&[T], &[T]) -> T + Sync,
@@ -45,6 +48,7 @@ where
     (0..n_samples)
         .into_par_iter()
         .map(|i| {
+            progress.fetch_add(1, SeqCst);
             (0..n_samples)
                 .into_par_iter()
                 .map(|j| dist_func(&data[i], &data[j]))
@@ -73,6 +77,7 @@ impl CoreDistance for KdTree {
         data: &[Vec<T>],
         k: usize,
         dist_metric: DistanceMetric,
+        progress: Arc<AtomicUsize>,
     ) -> Vec<T> {
         let mut tree: kdtree::KdTree<T, usize, &Vec<T>> = kdtree::KdTree::new(data[0].len());
         data.iter()
@@ -85,6 +90,7 @@ impl CoreDistance for KdTree {
                 let result = tree
                     .nearest(datapoint, k, &dist_func)
                     .expect("Failed to find neighbours");
+                progress.fetch_add(1, SeqCst);
                 result
                     .into_iter()
                     .map(|(dist, _idx)| dist)
@@ -102,6 +108,7 @@ impl BruteForce {
         data: &[Vec<T>],
         k: usize,
         dist_metric: DistanceMetric,
+        progress: Arc<AtomicUsize>,
     ) -> Vec<T> {
         let dist_func = distance::get_dist_func(&dist_metric);
 
@@ -116,6 +123,7 @@ impl BruteForce {
                     a.partial_cmp(b).expect("Invalid float")
                 );
 
+                progress.fetch_add(1, SeqCst);
                 distances[k - 1]
             })
             .collect()
@@ -127,6 +135,7 @@ impl BruteForce {
         k: usize,
         dist_metric: DistanceMetric,
         chunk_size: usize,
+        progress: Arc<AtomicUsize>,
     ) -> Vec<T> {
         let dist_func = distance::get_dist_func(&dist_metric);
 
@@ -142,6 +151,7 @@ impl BruteForce {
                         a.partial_cmp(b).expect("Invalid float")
                     );
 
+                    progress.fetch_add(1, SeqCst);
                     distances[k - 1]
                 }).collect::<Vec<_>>()
             })

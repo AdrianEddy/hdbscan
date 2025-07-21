@@ -7,6 +7,7 @@ use num_traits::Float;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use rayon::prelude::*;
+use std::sync::{ Arc, atomic::{ AtomicUsize, Ordering::SeqCst }};
 
 const BRUTE_FORCE_N_SAMPLES_LIMIT: usize = 250;
 
@@ -141,11 +142,11 @@ impl<'a, T: Float + Send + Sync> Hdbscan<'a, T> {
     /// // The final point is noise
     ///assert_eq!(-1, labels[10]);
     /// ```
-    pub fn cluster(&self) -> Result<Vec<i32>, HdbscanError> {
+    pub fn cluster(&self, progress: Arc<AtomicUsize>) -> Result<Vec<i32>, HdbscanError> {
         let validator = DataValidator::new(self.data, &self.hp);
         validator.validate_input_data()?;
-        let core_distances = self.calc_core_distances();
-        let min_spanning_tree = self.prims_min_spanning_tree(&core_distances);
+        let core_distances = self.calc_core_distances(progress.clone());
+        let min_spanning_tree = self.prims_min_spanning_tree(&core_distances, progress.clone());
         let single_linkage_tree = self.make_single_linkage_tree(&min_spanning_tree);
         let condensed_tree = self.condense_tree(&single_linkage_tree);
         let winning_clusters = self.extract_winning_clusters(&condensed_tree);
@@ -217,30 +218,30 @@ impl<'a, T: Float + Send + Sync> Hdbscan<'a, T> {
         ))
     }
 
-    fn calc_core_distances(&self) -> Vec<T> {
+    fn calc_core_distances(&self, progress: Arc<AtomicUsize>) -> Vec<T> {
         let (data, k, dist_metric) = (self.data, self.hp.min_samples, self.hp.dist_metric);
 
         match (&self.hp.nn_algo, self.n_samples, &self.hp.dist_metric) {
             (_, _, DistanceMetric::Precalculated) => get_core_distances_from_matrix(data, k),
             (NnAlgorithm::Auto, usize::MIN..=BRUTE_FORCE_N_SAMPLES_LIMIT, _) => {
                 // For small datasets, use the direct implementation
-                BruteForce::calc_core_distances_direct(data, k, dist_metric)
+                BruteForce::calc_core_distances_direct(data, k, dist_metric, progress)
             }
-            (NnAlgorithm::Auto, _, _) => KdTree::calc_core_distances(data, k, dist_metric),
+            (NnAlgorithm::Auto, _, _) => KdTree::calc_core_distances(data, k, dist_metric, progress),
             (NnAlgorithm::BruteForce, n, _) if n > 10_000 => {
                 // For very large datasets with BruteForce, use chunked implementation
                 let chunk_size = (n / rayon::current_num_threads()).max(100);
-                BruteForce::calc_core_distances_chunked(data, k, dist_metric, chunk_size)
+                BruteForce::calc_core_distances_chunked(data, k, dist_metric, chunk_size, progress)
             }
             (NnAlgorithm::BruteForce, _, _) => {
                 // For medium datasets, use the standard parallel implementation
-                BruteForce::calc_core_distances(data, k, dist_metric)
+                BruteForce::calc_core_distances(data, k, dist_metric, progress)
             }
-            (NnAlgorithm::KdTree, _, _) => KdTree::calc_core_distances(data, k, dist_metric),
+            (NnAlgorithm::KdTree, _, _) => KdTree::calc_core_distances(data, k, dist_metric, progress),
         }
     }
 
-    fn prims_min_spanning_tree(&self, core_distances: &[T]) -> Vec<MSTEdge<T>> {
+    fn prims_min_spanning_tree(&self, core_distances: &[T], progress: Arc<AtomicUsize>) -> Vec<MSTEdge<T>> {
         let mut in_tree = vec![false; self.n_samples];
         let mut distances = vec![T::infinity(); self.n_samples];
         distances[0] = T::zero();
@@ -285,6 +286,7 @@ impl<'a, T: Float + Send + Sync> Hdbscan<'a, T> {
                 distance: min_dist,
             });
             left_node_id = right_node_id;
+            progress.fetch_add(1, SeqCst);
         }
         self.sort_mst_by_dist(&mut mst);
         mst
