@@ -6,6 +6,7 @@ use crate::{distance, Center, DistanceMetric, HdbscanError, HdbscanHyperParams, 
 use num_traits::Float;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
+use rayon::prelude::*;
 
 const BRUTE_FORCE_N_SAMPLES_LIMIT: usize = 250;
 
@@ -19,7 +20,7 @@ pub struct Hdbscan<'a, T> {
     hp: HdbscanHyperParams,
 }
 
-impl<'a, T: Float> Hdbscan<'a, T> {
+impl<'a, T: Float + Send + Sync> Hdbscan<'a, T> {
     /// Creates an instance of HDBSCAN clustering model using a custom hyper parameter
     /// configuration.
     ///
@@ -222,10 +223,17 @@ impl<'a, T: Float> Hdbscan<'a, T> {
         match (&self.hp.nn_algo, self.n_samples, &self.hp.dist_metric) {
             (_, _, DistanceMetric::Precalculated) => get_core_distances_from_matrix(data, k),
             (NnAlgorithm::Auto, usize::MIN..=BRUTE_FORCE_N_SAMPLES_LIMIT, _) => {
-                BruteForce::calc_core_distances(data, k, dist_metric)
+                // For small datasets, use the direct implementation
+                BruteForce::calc_core_distances_direct(data, k, dist_metric)
             }
             (NnAlgorithm::Auto, _, _) => KdTree::calc_core_distances(data, k, dist_metric),
+            (NnAlgorithm::BruteForce, n, _) if n > 10_000 => {
+                // For very large datasets with BruteForce, use chunked implementation
+                let chunk_size = (n / rayon::current_num_threads()).max(100);
+                BruteForce::calc_core_distances_chunked(data, k, dist_metric, chunk_size)
+            }
             (NnAlgorithm::BruteForce, _, _) => {
+                // For medium datasets, use the standard parallel implementation
                 BruteForce::calc_core_distances(data, k, dist_metric)
             }
             (NnAlgorithm::KdTree, _, _) => KdTree::calc_core_distances(data, k, dist_metric),
@@ -244,25 +252,37 @@ impl<'a, T: Float> Hdbscan<'a, T> {
 
         for _ in 1..self.n_samples {
             in_tree[left_node_id] = true;
-            let mut current_min_dist = T::infinity();
 
-            for i in 0..self.n_samples {
-                if in_tree[i] {
-                    continue;
+            let (min_dist, min_idx) = (0..self.n_samples)
+                .into_par_iter()
+                .filter_map(|i| {
+                    if in_tree[i] {
+                        None
+                    } else {
+                        let mrd = self.calc_mutual_reachability_dist(left_node_id, i, core_distances);
+                        let dist = if mrd < distances[i] { mrd } else { distances[i] };
+                        Some((dist, i))
+                    }
+                })
+                .min_by(|(dist_a, _), (dist_b, _)| {
+                    dist_a.partial_cmp(dist_b).expect("Invalid floats")
+                })
+                .unwrap_or((T::infinity(), 0));
+
+            distances.par_iter_mut().enumerate().for_each(|(i, dist)| {
+                if !in_tree[i] {
+                    let mrd = self.calc_mutual_reachability_dist(left_node_id, i, core_distances);
+                    if mrd < *dist {
+                        *dist = mrd;
+                    }
                 }
-                let mrd = self.calc_mutual_reachability_dist(left_node_id, i, core_distances);
-                if mrd < distances[i] {
-                    distances[i] = mrd;
-                }
-                if distances[i] < current_min_dist {
-                    right_node_id = i;
-                    current_min_dist = distances[i];
-                }
-            }
+            });
+
+            right_node_id = min_idx;
             mst.push(MSTEdge {
                 left_node_id,
                 right_node_id,
-                distance: current_min_dist,
+                distance: min_dist,
             });
             left_node_id = right_node_id;
         }
@@ -549,6 +569,7 @@ impl<'a, T: Float> Hdbscan<'a, T> {
         condensed_tree: &CondensedTree<T>,
     ) -> HashMap<usize, T> {
         cluster_id_range
+            .into_par_iter()
             .map(|cluster_id| (cluster_id, self.calc_stability(cluster_id, condensed_tree)))
             .collect()
     }
@@ -556,10 +577,10 @@ impl<'a, T: Float> Hdbscan<'a, T> {
     fn calc_stability(&self, cluster_id: usize, condensed_tree: &CondensedTree<T>) -> T {
         let lambda_birth = self.extract_lambda_birth(cluster_id, condensed_tree);
         condensed_tree
-            .iter()
+            .par_iter()
             .filter(|node| node.parent_node_id == cluster_id)
             .map(|node| (node.lambda_birth - lambda_birth) * T::from(node.size).unwrap_or(T::one()))
-            .fold(T::zero(), std::ops::Add::add)
+            .reduce(|| T::zero(), |a, b| a + b)
     }
 
     fn extract_lambda_birth(&self, cluster_id: usize, condensed_tree: &CondensedTree<T>) -> T {
@@ -597,7 +618,7 @@ impl<'a, T: Float> Hdbscan<'a, T> {
     fn get_cluster_size(&self, cluster_id: &usize, condensed_tree: &CondensedTree<T>) -> usize {
         if self.hp.allow_single_cluster && self.is_top_cluster(cluster_id) {
             condensed_tree
-                .iter()
+                .par_iter()
                 .filter(|node| self.is_cluster(&node.node_id))
                 .filter(|node| &node.parent_node_id == cluster_id)
                 .map(|node| node.size)
@@ -645,27 +666,47 @@ impl<'a, T: Float> Hdbscan<'a, T> {
         condensed_tree: &CondensedTree<T>,
     ) -> Vec<usize> {
         let epsilon = T::from(self.hp.epsilon).expect("Couldn't convert f64 epsilon to T");
+
+        let results: Vec<(usize, Vec<usize>)> = winning_clusters
+            .par_iter()
+            .filter_map(|cluster_id| {
+                let cluster_epsilon = self.calc_cluster_epsilon(*cluster_id, condensed_tree, epsilon);
+
+                if cluster_epsilon < epsilon {
+                    let winning_cluster_id =
+                        self.find_higher_node_sufficient_epsilon(*cluster_id, condensed_tree, epsilon);
+                    let sub_nodes = self.find_child_clusters(&winning_cluster_id, condensed_tree);
+                    Some((winning_cluster_id, sub_nodes))
+                } else {
+                    Some((*cluster_id, vec![]))
+                }
+            })
+            .collect();
+
+        // Process results to handle duplicates
         let mut processed: Vec<usize> = Vec::new();
         let mut winning_epsilon_clusters = Vec::new();
 
-        for cluster_id in winning_clusters.iter() {
-            let cluster_epsilon = self.calc_cluster_epsilon(*cluster_id, condensed_tree, epsilon);
-
-            if cluster_epsilon < epsilon {
-                if processed.contains(cluster_id) {
-                    continue;
-                }
-                let winning_cluster_id =
-                    self.find_higher_node_sufficient_epsilon(*cluster_id, condensed_tree, epsilon);
-                winning_epsilon_clusters.push(winning_cluster_id);
-
-                for sub_node in self.find_child_clusters(&winning_cluster_id, condensed_tree) {
-                    if sub_node != winning_cluster_id {
-                        processed.push(sub_node)
+        for (winning_id, sub_nodes) in results {
+            if sub_nodes.is_empty() {
+                winning_epsilon_clusters.push(winning_id);
+            } else {
+                let mut should_add = true;
+                for sub_node in &sub_nodes {
+                    if processed.contains(sub_node) && *sub_node == winning_id {
+                        should_add = false;
+                        break;
                     }
                 }
-            } else {
-                winning_epsilon_clusters.push(*cluster_id);
+
+                if should_add {
+                    winning_epsilon_clusters.push(winning_id);
+                    for sub_node in sub_nodes {
+                        if sub_node != winning_id {
+                            processed.push(sub_node);
+                        }
+                    }
+                }
             }
         }
         winning_epsilon_clusters
@@ -732,12 +773,23 @@ impl<'a, T: Float> Hdbscan<'a, T> {
         let mut labels = vec![-1; self.n_samples];
         let n_clusters = winning_clusters.len();
 
-        for (current_cluster_id, cluster_id) in winning_clusters.iter().enumerate() {
-            let node_size = self.get_cluster_size(cluster_id, condensed_tree);
-            self.find_child_samples(*cluster_id, node_size, n_clusters, condensed_tree)
-                .into_iter()
-                .for_each(|id| labels[id] = current_cluster_id as i32);
+
+        let label_assignments: Vec<(usize, Vec<usize>)> = winning_clusters
+            .par_iter()
+            .enumerate()
+            .map(|(current_cluster_id, cluster_id)| {
+                let node_size = self.get_cluster_size(cluster_id, condensed_tree);
+                let child_samples = self.find_child_samples(*cluster_id, node_size, n_clusters, condensed_tree);
+                (current_cluster_id, child_samples)
+            })
+            .collect();
+
+        for (current_cluster_id, child_samples) in label_assignments {
+            for id in child_samples {
+                labels[id] = current_cluster_id as i32;
+            }
         }
+
         labels
     }
 

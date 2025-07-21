@@ -1,5 +1,6 @@
 use crate::{distance, DistanceMetric};
 use num_traits::Float;
+use rayon::prelude::*;
 
 /// The nearest neighbour algorithm options
 #[derive(Debug, Clone, PartialEq)]
@@ -14,7 +15,7 @@ pub enum NnAlgorithm {
 }
 
 pub(crate) trait CoreDistance {
-    fn calc_core_distances<T: Float>(
+    fn calc_core_distances<T: Float + Send + Sync>(
         data: &[Vec<T>],
         k: usize,
         dist_metric: DistanceMetric,
@@ -24,51 +25,51 @@ pub(crate) trait CoreDistance {
 pub(crate) struct BruteForce;
 
 impl CoreDistance for BruteForce {
-    fn calc_core_distances<T: Float>(
+    fn calc_core_distances<T: Float + Send + Sync>(
         data: &[Vec<T>],
         k: usize,
         dist_metric: DistanceMetric,
     ) -> Vec<T> {
-        let dist_matrix = calc_pairwise_distances(data, distance::get_dist_func(&dist_metric));
+        let dist_matrix = calc_pairwise_distances_parallel(data, distance::get_dist_func(&dist_metric));
         get_core_distances_from_matrix(&dist_matrix, k)
     }
 }
 
-fn calc_pairwise_distances<T, F>(data: &[Vec<T>], dist_func: F) -> Vec<Vec<T>>
+fn calc_pairwise_distances_parallel<T, F>(data: &[Vec<T>], dist_func: F) -> Vec<Vec<T>>
 where
-    T: Float,
-    F: Fn(&[T], &[T]) -> T,
+    T: Float + Send + Sync,
+    F: Fn(&[T], &[T]) -> T + Sync,
 {
     let n_samples = data.len();
-    let mut dist_matrix = vec![vec![T::nan(); n_samples]; n_samples];
 
-    for i in 0..n_samples {
-        for j in 0..n_samples {
-            let a = &data[i];
-            let b = &data[j];
-            dist_matrix[i][j] = dist_func(a, b);
-        }
-    }
-    dist_matrix
+    (0..n_samples)
+        .into_par_iter()
+        .map(|i| {
+            (0..n_samples)
+                .into_par_iter()
+                .map(|j| dist_func(&data[i], &data[j]))
+                .collect()
+        })
+        .collect()
 }
 
-pub(crate) fn get_core_distances_from_matrix<T: Float>(dist_matrix: &[Vec<T>], k: usize) -> Vec<T> {
-    let n_samples = dist_matrix.len();
-    let mut core_distances = Vec::with_capacity(n_samples);
-
-    for distances in dist_matrix.iter().take(n_samples) {
-        let mut distances = distances.clone();
-        distances.sort_by(|a, b| a.partial_cmp(b).expect("Invalid float"));
-        core_distances.push(distances[k - 1]);
-    }
-
-    core_distances
+pub(crate) fn get_core_distances_from_matrix<T: Float + Send + Sync>(dist_matrix: &[Vec<T>], k: usize) -> Vec<T> {
+    dist_matrix
+        .par_iter()
+        .map(|distances| {
+            let mut sorted_distances = distances.clone();
+            sorted_distances.par_sort_unstable_by(|a, b|
+                a.partial_cmp(b).expect("Invalid float")
+            );
+            sorted_distances[k - 1]
+        })
+        .collect()
 }
 
 pub(crate) struct KdTree;
 
 impl CoreDistance for KdTree {
-    fn calc_core_distances<T: Float>(
+    fn calc_core_distances<T: Float + Send + Sync>(
         data: &[Vec<T>],
         k: usize,
         dist_metric: DistanceMetric,
@@ -79,7 +80,7 @@ impl CoreDistance for KdTree {
             .for_each(|(n, datapoint)| tree.add(datapoint, n).expect("Failed to add to KdTree"));
 
         let dist_func = distance::get_dist_func(&dist_metric);
-        data.iter()
+        data.par_iter()
             .map(|datapoint| {
                 let result = tree
                     .nearest(datapoint, k, &dist_func)
@@ -89,6 +90,60 @@ impl CoreDistance for KdTree {
                     .map(|(dist, _idx)| dist)
                     .last()
                     .expect("Failed to find neighbours")
+            })
+            .collect()
+    }
+}
+
+impl BruteForce {
+    /// Direct parallel implementation without building full distance matrix
+    /// More memory efficient for large datasets
+    pub fn calc_core_distances_direct<T: Float + Send + Sync>(
+        data: &[Vec<T>],
+        k: usize,
+        dist_metric: DistanceMetric,
+    ) -> Vec<T> {
+        let dist_func = distance::get_dist_func(&dist_metric);
+
+        data.par_iter()
+            .map(|point| {
+                let mut distances: Vec<T> = data
+                    .par_iter()
+                    .map(|other| dist_func(point, other))
+                    .collect();
+
+                distances.par_sort_unstable_by(|a, b|
+                    a.partial_cmp(b).expect("Invalid float")
+                );
+
+                distances[k - 1]
+            })
+            .collect()
+    }
+
+    /// Chunked implementation to balance parallelism overhead
+    pub fn calc_core_distances_chunked<T: Float + Send + Sync>(
+        data: &[Vec<T>],
+        k: usize,
+        dist_metric: DistanceMetric,
+        chunk_size: usize,
+    ) -> Vec<T> {
+        let dist_func = distance::get_dist_func(&dist_metric);
+
+        data.par_chunks(chunk_size)
+            .flat_map(|chunk| {
+                chunk.iter().map(|point| {
+                    let mut distances: Vec<T> = data
+                        .iter()
+                        .map(|other| dist_func(point, other))
+                        .collect();
+
+                    distances.sort_unstable_by(|a, b|
+                        a.partial_cmp(b).expect("Invalid float")
+                    );
+
+                    distances[k - 1]
+                }).collect::<Vec<_>>()
             })
             .collect()
     }
